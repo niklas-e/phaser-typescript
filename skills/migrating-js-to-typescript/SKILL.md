@@ -197,6 +197,226 @@ Keep file-scoped; requires inlining in the `MODULE_TYPE_RULES` table in `Migrate
 getPoints<O extends Vector2[] = Vector2[]>(quantity: number, stepRate?: number, output?: O): O
 ```
 
+## Mixin Component Migration
+
+Phaser components (e.g., Depth, Visible) use descriptor-bag mixins. Migrating them requires two distinct patterns:
+- **Migrated mixin component:** interface + descriptor-bag + typed mixin function
+- **Migrated class consuming mixins:** `composeMixins` for migrated mixins, `applyMixin` for unmigrated descriptor-bags, declaration merging for unmigrated type surface
+
+### Mixin utility (`src/utils/Mixin.ts`)
+
+Use these helpers; do not invent a parallel mixin abstraction:
+
+```ts
+import { applyMixin, defineMixin, composeMixins } from '../../utils/Mixin.js';
+```
+
+- **`applyMixin(target, mixin)`** — Runtime application for unmigrated descriptor-bag mixins
+- **`defineMixin<TAdded>()`** — Declares a typed migrated mixin function
+- **`composeMixins(...mixins)`** — Builds a typed base class from migrated mixin functions
+
+### Mixin module structure
+
+A migrated mixin component must export four things:
+
+```ts
+// src/gameobjects/components/Depth.ts
+
+/**
+ * Interface describing the public API contributed by the Depth mixin.
+ *
+ * @memberof Phaser.GameObjects.Components
+ * @since 3.0.0
+ */
+export interface DepthMixin
+{
+    _depth: number;
+    depth: number;
+    setDepth(value?: number): this;
+    setToTop(): this;
+    setToBack(): this;
+    setAbove(gameObject: object): this;
+    setBelow(gameObject: object): this;
+}
+
+/**
+ * Runtime descriptor-bag for the Depth mixin.
+ * @since 3.0.0
+ */
+export const DepthDescriptors = {
+    _depth: 0,
+    depth: { get: function() { ... }, set: function() { ... } },
+    setDepth: function() { ... },
+    // ...
+};
+
+/**
+ * Provides methods used for setting the depth of a Game Object.
+ * Should be applied as a mixin and not used directly.
+ *
+ * @namespace Phaser.GameObjects.Components.Depth
+ * @since 3.0.0
+ */
+export const Depth = defineMixin<DepthMixin>()(function Depth (Base)
+{
+    applyMixin(Base, DepthDescriptors);
+    return Base;
+});
+
+export default Depth;
+```
+
+**Key elements:**
+1. **`export interface XMixin`** — Typed contract for what the mixin provides (used by `defineMixin<T>()`)
+2. **`export const XDescriptors`** — Runtime descriptor-bag consumed by the CJS wrapper for JS callers
+3. **`export const X = defineMixin<XMixin>()(…)`** — Typed mixin function for TS callers
+4. **`export default X`** — Default export used by TS imports and compatibility wrappers
+5. **`@namespace Phaser.GameObjects.Components.X`** — Required for auto-discovery by tsgen overlay
+
+### CJS wrapper for mixin components
+
+The sibling `.js` wrapper exports the **descriptor-bag**, not the mixin function, because JS `Class()` factory `Mixins` arrays expect descriptor-bag objects:
+
+```js
+// src/gameobjects/components/Depth.js
+module.exports = require('./Depth.ts').DepthDescriptors;
+```
+
+### Auto-discovery: `@namespace` tag
+
+Mixin modules cannot use `@memberof + export class` (they export a `const`, not a class). Instead, auto-discovery uses the `@namespace` JSDoc tag:
+
+```ts
+/**
+ * @namespace Phaser.GameObjects.Components.Depth
+ * @since 3.0.0
+ */
+export const Depth = defineMixin<DepthMixin>()(function Depth (Base) { ... });
+```
+
+The `extractCanonicalSymbols` function in `MigratedOverlay.ts` matches:
+- `@namespace Phaser.X.Y.Z` where the last segment (`Z`) matches an `export const Z`, `export function Z`, or `export class Z` in the same file
+
+### Type normalization rules for mixins
+
+The tsc-emitted interface name is `DepthMixin` (as exported), but `phaser.d.ts` needs it as `Depth` (matching the canonical symbol). Add a replacement rule:
+
+```ts
+// In MODULE_TYPE_RULES in MigratedOverlay.ts:
+'src/gameobjects/components/Depth.ts': [
+    { type: 'replace', pattern: /\bDepthMixin\b/g, replacement: 'Depth' },
+],
+'src/gameobjects/components/Visible.ts': [
+    { type: 'replace', pattern: /\bVisibleMixin\b/g, replacement: 'Visible' },
+],
+```
+
+### Consuming mixins from a migrated class
+
+When a `Class()` factory with `Mixins: [...]` is migrated to a native `class`, split the mixins by migration state:
+- **Migrated mixins:** use `composeMixins(...)` in the base class expression
+- **Unmigrated mixins:** apply after class declaration with `applyMixin(ClassName, Components.X)`
+- **Unmigrated type surface:** declare via a companion `export interface ClassName { ... }`
+
+```ts
+// src/gameobjects/zone/Zone.ts
+import Visible from '../components/Visible.js';
+import Depth from '../components/Depth.js';
+import Components from '../components/index.js';
+import { applyMixin, composeMixins } from '../../utils/Mixin.js';
+import { TODO_MIGRATE_GameObject } from '../../utils/migrationPlaceholders.js';
+
+const ZoneBase = composeMixins(Visible, Depth)(TODO_MIGRATE_GameObject);
+
+export class Zone extends ZoneBase
+{
+    constructor (scene: object, x: number, y: number, width: number = 1, height: number = width)
+    {
+        super(scene, 'Zone');
+        // ...
+    }
+}
+
+// Runtime application for unmigrated descriptor-bag mixins.
+applyMixin(Zone, Components.GetBounds);
+applyMixin(Zone, Components.Origin);
+applyMixin(Zone, Components.ScrollFactor);
+applyMixin(Zone, Components.Transform);
+
+// Declaration merging for unmigrated mixin / JS parent surface used by Zone.
+// Remove entries as each dependency is migrated to TypeScript.
+export interface Zone
+{
+    scaleX: number;
+    scaleY: number;
+    setPosition(x: number, y: number): this;
+    updateDisplayOrigin(): this;
+}
+```
+
+**Strict rules:**
+- Do not drop runtime mixins: every unmigrated descriptor-bag from the old `Mixins` array still needs an `applyMixin` call.
+- Do not rely on `applyMixin` for types: add declaration-merging entries for unmigrated mixin members that the class body uses.
+- Remove declaration-merging entries as their dependencies migrate to typed mixins.
+- `TODO_MIGRATE_GameObject` is only a bridge for unmigrated JS base classes; replace it with the real class type once migrated.
+
+### Migration placeholders (`src/utils/migrationPlaceholders.ts`)
+
+When a TS class extends an unmigrated JS `Class()` factory, cast it to a minimal constructor type:
+
+```ts
+// src/utils/migrationPlaceholders.ts
+import GameObject from '../gameobjects/GameObject';
+
+export const TODO_MIGRATE_GameObject = GameObject as unknown as new (scene: object, type: string) => object;
+export type TODO_MIGRATE_Callback = (...args: any[]) => any;
+```
+
+The `MODULE_TYPE_RULES` table replaces `TODO_MIGRATE_GameObject` with `Phaser.GameObjects.GameObject` in the emitted `.d.ts`:
+
+```ts
+'src/gameobjects/zone/Zone.ts': [
+    { type: 'replace', pattern: /\bTODO_MIGRATE_GameObject\b/g, replacement: 'Phaser.GameObjects.GameObject' },
+],
+```
+
+### Ambient type declarations for component barrels
+
+When migrated components are consumed via a CJS barrel (`src/gameobjects/components/index.js`), add an ambient `.d.ts` that types the barrel for TS consumers:
+
+```ts
+// src/gameobjects/components/index.d.ts
+import type { DepthMixin } from './Depth.js';
+import type { VisibleMixin } from './Visible.js';
+
+type DescriptorBag = Record<string, unknown>;
+type MixinFn<Mixin> = <T extends abstract new (...args: any[]) => object>(Base: T) =>
+    T & (abstract new (...args: any[]) => Mixin);
+
+interface Components {
+    // --- Migrated components ---
+    Depth: MixinFn<DepthMixin>;
+    Visible: MixinFn<VisibleMixin>;
+
+    // --- Unmigrated components (descriptor bags) ---
+    Alpha: DescriptorBag;
+    // ... other unmigrated components
+}
+
+declare const Components: Components;
+export default Components;
+export type { DepthMixin, VisibleMixin };
+```
+
+This prevents TS9005/TS9006 declaration-emit errors when TS modules import the barrel.
+
+### JSDoc `@extends` handling for classes with mixins
+
+When migrating a class that previously used `Mixins: [Components.Depth, Components.Visible, ...]`:
+- **Remove** `@extends Phaser.GameObjects.Components.Depth` (now handled by `composeMixins` in TS)
+- **Remove** `@extends Phaser.GameObjects.Components.Visible` (same)
+- **Keep** `@extends` for unmigrated descriptor-bag mixins that remain documented by JSDoc and are applied with `applyMixin`
+
 ## JS Class() Factory Interop
 
 When a migrated `.ts` module references a JS `Class()` factory (e.g., `Line`), `typeof X.prototype` with `@ts-expect-error` may be necessary:
@@ -243,9 +463,10 @@ JSDoc (.js files)                    TypeScript (.ts files)
                  phaser.d.ts
 ```
 
-**Auto-discovery:** `discoverMigratedModules()` in `MigratedOverlay.ts` globs `src/**/*.ts` (excluding `.d.ts`) and discovers canonical symbols via two patterns:
+**Auto-discovery:** `discoverMigratedModules()` in `MigratedOverlay.ts` globs `src/**/*.ts` (excluding `.d.ts`) and discovers canonical symbols via three patterns:
 - **Functions:** `@function Phaser.X.Y` JSDoc tag provides the full canonical symbol directly
 - **Classes:** `@memberof Phaser.X` JSDoc tag combined with the `export class Name` declaration that follows the JSDoc block
+- **Mixins/Namespaces:** `@namespace Phaser.X.Y.Z` JSDoc tag where the last segment matches an `export const Z` (or `export function`/`export class`) in the same file
 
 No manual registration is needed.
 
@@ -274,7 +495,7 @@ No manual registration is needed.
 
 | Mistake | Fix |
 |---------|-----|
-| Removing identity/ownership tags | Keep `@function Phaser.X` or `@memberof Phaser.X` - auto-discovery depends on them |
+| Removing identity/ownership tags | Keep `@function Phaser.X` or `@memberof Phaser.X` or `@namespace Phaser.X` - auto-discovery depends on them |
 | Removing `@since` | Keep it - documents API version history |
 | Removing `@param`/`@returns` descriptions | Keep descriptions, only remove `{Type}` braces |
 | Using `Object.keys()` in generic class | Use `objectKeys<K>()` to preserve key type |
@@ -286,6 +507,12 @@ No manual registration is needed.
 | Widening scope to unmigrated modules | Each migration is self-contained; don't pull in dependencies |
 | Not keeping typedef `.js` files | tsgen needs them to emit `Phaser.Types.*` entries |
 | Unexplained `@ts-expect-error` | Use it only for verified TS/JS interop gaps and explain the mismatch |
+| Mixin CJS wrapper exports the mixin function | JS `Class()` `Mixins` arrays need the descriptor-bag, not the mixin function. Export `XDescriptors`. |
+| Missing `@namespace` tag on mixin module | tsgen overlay won't discover the symbol. Add `@namespace Phaser.X.Y.Z` above the `export const` |
+| Dropping unmigrated runtime mixins | Preserve each old unmigrated `Mixins` entry with `applyMixin(ClassName, Components.X)`. |
+| Assuming `applyMixin` supplies types | It only changes runtime prototypes. Add companion `export interface ClassName { ... }` entries for unmigrated members used by TS code. |
+| Keeping `@extends` for migrated mixins | Remove `@extends` for mixins handled by `composeMixins`; keep only for unmigrated descriptor-bags applied with `applyMixin` |
+| Not adding MODULE_TYPE_RULES for mixin interface rename | tsc emits `DepthMixin`; `.d.ts` needs `Depth`. Add a replace rule. |
 
 ## Quick Reference
 
@@ -294,6 +521,9 @@ No manual registration is needed.
 | Migration overlay (discovery, normalization, validation) | `scripts/tsgen/src/MigratedOverlay.ts` |
 | Orchestrator | `scripts/tsgen/src/publish.ts` |
 | Type normalization rules | `MODULE_TYPE_RULES` in `scripts/tsgen/src/MigratedOverlay.ts` |
+| Mixin utility (applyMixin, defineMixin, composeMixins) | `src/utils/Mixin.ts` |
+| Migration placeholders (TODO_MIGRATE_*) | `src/utils/migrationPlaceholders.ts` |
+| Components barrel ambient types | `src/gameobjects/components/index.d.ts` |
 | Shared typed utilities | `src/utils/object/TypedObjectUtils.ts` |
 | Symbol validation guard | `scripts/validate-migrated-symbols.js` |
 | JSDoc types guard | `scripts/check-migrated-jsdoc-types.js` |
@@ -304,8 +534,11 @@ No manual registration is needed.
 
 | Need | Action |
 |------|--------|
-| Converted a source module | Ensure it has `@function Phaser.X` (for functions) or `@memberof Phaser.X` (for classes) for auto-discovery |
+| Converted a source module | Ensure it has `@function Phaser.X` (for functions) or `@memberof Phaser.X` (for classes) or `@namespace Phaser.X` (for mixins) for auto-discovery |
+| Migrating a mixin component | Use `defineMixin<T>()` pattern, export interface + descriptors + mixin const, use `@namespace` tag |
+| Migrating a class that uses mixins | Use `composeMixins(...)` for migrated mixins, `applyMixin(...)` for unmigrated mixins, declaration merging for unmigrated type surface |
 | Module uses unqualified peer types | Add entry to `MODULE_TYPE_RULES` in `MigratedOverlay.ts` |
+| Mixin interface name differs from canonical | Add `replace` rule to rename (e.g., `DepthMixin` → `Depth`) in `MODULE_TYPE_RULES` |
 | Edited `MigratedOverlay.ts` or `publish.ts` | Run `npm run build-tsgen` before `npm run ts` |
 | Runtime/test code loads `src/**/*.js` | Keep a sibling `.js` CJS wrapper |
 | `.d.ts` contains local type names | Normalize only namespace qualification or non-exported alias inlining |
